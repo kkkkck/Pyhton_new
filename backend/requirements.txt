@@ -1,0 +1,8 @@
+Django==5.2
+djangorestframework==3.16.0
+mysqlclient==2.2.7
+requests==2.32.3
+python-dotenv==1.0.0
+django-cors-headers==4.7.0
+pydantic-core==2.33.1
+gunicorn==21.2.0
