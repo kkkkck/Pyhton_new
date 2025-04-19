@@ -7,6 +7,9 @@ class ChatHistory(models.Model):
     timestamp = models.DateTimeField(auto_now_add=True, verbose_name="时间戳")
     model_metadata = models.JSONField(verbose_name="模型元数据", default=dict)
 
+    def __str__(self):
+        return f"对话于 {self.created_at.strftime('%Y-%m-%d %H:%M:%S')}"
+
     class Meta:
         ordering = ['-timestamp']
         verbose_name = '聊天记录'

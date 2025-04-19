@@ -148,6 +148,7 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:8080",
     "http://127.0.0.1:8080",
+    "http://localhost:8000",
 ]
 CORS_ALLOW_CREDENTIALS = True  # 允许跨域携带凭证
 

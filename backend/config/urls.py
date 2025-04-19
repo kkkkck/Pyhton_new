@@ -20,10 +20,15 @@ from django.http import JsonResponse
 from django.urls import include, path
 from django.views.generic import TemplateView
 from django.urls import re_path
+from django.conf import settings
+from django.conf.urls.static import static
 
 urlpatterns = [
     path("admin/", admin.site.urls),
     path('api/', include('app.urls')),  # 包含应用路由
     path('healthcheck/', lambda _: JsonResponse({"status": "ok"})),  # 健康检查端点
     re_path(r'^$', TemplateView.as_view(template_name='index.html')),
-]
+] + static(settings.STATIC_URL, document_root=settings.STATICFILES_DIRS[0])
+
+if settings.DEBUG:
+    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATICFILES_DIRS[0])
