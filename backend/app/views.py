@@ -1,19 +1,21 @@
-from rest_framework.decorators import api_view,throttle_classes
+from rest_framework.decorators import api_view, throttle_classes
 from rest_framework.response import Response
 from rest_framework.throttling import UserRateThrottle
 from rest_framework import status
 import requests
-from .models import ChatHistory
 import logging
 import json
-from django.http import StreamingHttpResponse  # 导入 StreamingHttpResponse
+from django.http import StreamingHttpResponse
+from .models import ChatHistory
+import uuid
+from django.db.models import Max
 
 logger = logging.getLogger(__name__)
 
 @api_view(['DELETE'])
 def delete_conversation(request, conversation_id):
     try:
-        conversation = ChatHistory.objects.get(id=conversation_id)
+        conversation = ChatHistory.objects.get(conversation_id=conversation_id)
         conversation.delete()
         return Response({'message': f'对话 {conversation_id} 已成功删除'}, status=status.HTTP_200_OK)
     except ChatHistory.DoesNotExist:
@@ -25,52 +27,59 @@ def delete_conversation(request, conversation_id):
 @api_view(['GET'])
 def get_conversation_detail(request, conversation_id):
     try:
-        conversation = ChatHistory.objects.filter(id=conversation_id).order_by('timestamp').values('user_message', 'bot_message')
-        return Response(list(conversation))
+        conversation = ChatHistory.objects.get(conversation_id=conversation_id)
+        return Response(conversation.messages)
+    except ChatHistory.DoesNotExist:
+        return Response({'error': f'找不到 ID 为 {conversation_id} 的对话'}, status=status.HTTP_404_NOT_FOUND)
     except Exception as e:
-        return Response({'error': str(e)}, status=500)
+        logger.error(f"获取对话 {conversation_id} 详情失败: {e}")
+        return Response({'error': f'获取对话 {conversation_id} 详情时发生错误: {e}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @api_view(['GET'])
 def get_chat_history(request):
     try:
-        history = ChatHistory.objects.order_by('-timestamp').values('id', 'user_message', 'bot_message', 'timestamp')[:20] # 获取最近的 20 条记录，可以根据你的需求调整
-        # 可以根据你的需求格式化返回的数据，例如提取一个简单的对话标题
+        # 获取每个 conversation_id 的最新记录，并使用第一条用户消息作为标题
+        unique_conversations = ChatHistory.objects.values('conversation_id').annotate(latest_timestamp=Max('timestamp')).order_by('-latest_timestamp')[:20]
+        history = ChatHistory.objects.filter(conversation_id__in=[item['conversation_id'] for item in unique_conversations]).order_by('-timestamp')
+
         formatted_history = []
         for item in history:
-            title = f"用户: {item['user_message'][:20]}... | 机器人: {item['bot_message'][:20]}..." if item['user_message'] and item['bot_message'] else f"对话 ID: {item['id']}"
-            formatted_history.append({'id': item['id'], 'title': title})
+            title = f"新对话 {item.conversation_id}"
+            if item.messages and len(item.messages) > 0 and item.messages[0].get('sender') == 'user':
+                title = f"用户: {item.messages[0].get('content', '')[:30]}..."
+            elif item.messages and len(item.messages) > 0:
+                # 如果第一条不是用户消息，尝试查找第一条用户消息
+                for msg in item.messages:
+                    if msg.get('sender') == 'user':
+                        title = f"用户: {msg.get('content', '')[:30]}..."
+                        break
+
+            formatted_history.append({'id': str(item.conversation_id), 'title': title, 'timestamp': item.timestamp})
         return Response(formatted_history)
     except Exception as e:
-        return Response({'error': str(e)}, status=500)
-
+        logger.error(f"获取聊天历史失败: {e}")
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @api_view(['POST'])
-@throttle_classes([UserRateThrottle])  # 添加限流
+@throttle_classes([UserRateThrottle])
 def chat(request):
-    try:
-        # 请求参数验证
-        if not request.data.get('message'):
-            return Response({
-                "status": "error",
-                "code": "EMPTY_MESSAGE",
-                "message": "消息内容不能为空"
-            }, status=status.HTTP_400_BAD_REQUEST)
+    user_message = request.data.get('message')
+    conversation_id_str = request.data.get('conversation_id')
 
-        # 调用 DeepSeek 模型
+    if not user_message:
+        return Response({"status": "error", "code": "EMPTY_MESSAGE", "message": "消息内容不能为空"}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
         ollama_response = requests.post(
             'http://localhost:11434/api/generate',
-            json={
-                "model": "deepseek-r1:1.5b",
-                "prompt": request.data['message'],
-                "stream": True,
-                "options": {"temperature": 0.7}  # 增加生成参数
-            },
+            json={"model": "deepseek-r1:1.5b", "prompt": user_message, "stream": True, "options": {"temperature": 0.7}},
             stream=True,
             timeout=60
         )
         ollama_response.raise_for_status()
 
         def generate():
+            nonlocal conversation_id_str
             full_response = []
             try:
                 for chunk in ollama_response.iter_lines():
@@ -78,23 +87,43 @@ def chat(request):
                         decoded_chunk = json.loads(chunk.decode())
                         content = decoded_chunk.get('response', '')
                         full_response.append(content)
-                        yield f"data: {json.dumps({'content': content})}\n\n"  # SSE格式
+                        yield f"data: {json.dumps({'content': content})}\n\n"
 
-                # 流式结束后保存完整记录
-                ChatHistory.objects.create(
-                    user_message=request.data['message'],
-                    bot_message=''.join(full_response),
-                    model_metadata={"model": "deepseek-r1:1.5b"}
-                )
+                bot_message = ''.join(full_response)
+                message_data = {"sender": "bot", "content": bot_message}
+                user_message_data = {"sender": "user", "content": user_message}
+
+                if conversation_id_str:
+                    try:
+                        conversation_id = uuid.UUID(conversation_id_str)
+                        chat_history = ChatHistory.objects.get(conversation_id=conversation_id)
+                        chat_history.messages.append(user_message_data)
+                        chat_history.messages.append(message_data)
+                        chat_history.save()
+                    except ChatHistory.DoesNotExist:
+                        new_chat_history = ChatHistory.objects.create(
+                            messages=[user_message_data, message_data],
+                            model_metadata={"model": "deepseek-r1:1.5b"}
+                        )
+                        conversation_id_str = str(new_chat_history.conversation_id)
+                else:
+                    new_chat_history = ChatHistory.objects.create(
+                        messages=[user_message_data, message_data],
+                        model_metadata={"model": "deepseek-r1:1.5b"}
+                    )
+                    conversation_id_str = str(new_chat_history.conversation_id)
+
             except Exception as e:
-                logger.error(f"保存记录失败: {str(e)}")
+                logger.error(f"保存/更新对话记录失败: {e}")
             finally:
-                ollama_response.close() # 确保关闭连接
+                ollama_response.close()
 
-        return StreamingHttpResponse(generate(), content_type='text/event-stream')
+        response = StreamingHttpResponse(generate(), content_type='text/event-stream')
+        response['X-Conversation-ID'] = conversation_id_str
+        return response
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"模型服务调用失败: {str(e)}", exc_info=True)
+        logger.error(f"模型服务调用失败: {e}", exc_info=True)
         return Response({
             "status": "error",
             "code": "MODEL_SERVICE_UNAVAILABLE",
@@ -102,7 +131,7 @@ def chat(request):
         }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
     except Exception as e:
-        logger.error(f"服务器内部错误: {str(e)}", exc_info=True)
+        logger.error(f"服务器内部错误: {e}", exc_info=True)
         return Response({
             "status": "error",
             "code": "INTERNAL_SERVER_ERROR",
